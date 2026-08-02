@@ -260,7 +260,14 @@ def predict_quantiles_sorted(models, X_row):
 
 
 def walk_forward_validation(X, y, weight, dates, min_train=8):
-    preds, actuals, pred_dates = [], [], []
+    """
+    Also computes a naive "persistence" baseline (predict next week = last
+    week's actual) alongside the model's walk-forward RMSE. If the model
+    can't beat this trivial baseline, that's important to know — it would
+    mean the model isn't adding predictive value beyond "you're about as fit
+    as you were last week."
+    """
+    preds, actuals, pred_dates, naive_preds = [], [], [], []
     for i in range(min_train, len(X)):
         model = XGBRegressor(objective='reg:quantileerror', quantile_alpha=0.5,
                               n_estimators=75, max_depth=2, learning_rate=0.05,
@@ -270,11 +277,47 @@ def walk_forward_validation(X, y, weight, dates, min_train=8):
         preds.append(model.predict(X.iloc[[i]])[0])
         actuals.append(y.iloc[i])
         pred_dates.append(dates[i])
+        naive_preds.append(y.iloc[i - 1])  # persistence baseline: last observed value
     if not preds:
         return None
     errors = np.array(preds) - np.array(actuals)
+    naive_errors = np.array(naive_preds) - np.array(actuals)
     rmse = np.sqrt((errors ** 2).mean())
-    return {'dates': pred_dates, 'predicted': preds, 'actual': actuals, 'rmse': rmse, 'bias': errors.mean()}
+    naive_rmse = np.sqrt((naive_errors ** 2).mean())
+    return {'dates': pred_dates, 'predicted': preds, 'actual': actuals, 'rmse': rmse,
+            'bias': errors.mean(), 'naive_rmse': naive_rmse}
+
+
+def walk_forward_calibration(X, y, weight, dates, min_train=8):
+    """
+    Checks whether the quantile intervals are actually calibrated: a well-
+    calibrated [low, high] interval (here nominally an 80%-20% = 60% band)
+    should contain the true outcome about 60% of the time. Without this
+    check, the displayed prediction range is a plausible-looking number with
+    no guarantee it means what it claims to mean.
+    """
+    records = []
+    for i in range(min_train, len(X)):
+        step_models = {}
+        for name, q in QUANTILES.items():
+            m = XGBRegressor(objective='reg:quantileerror', quantile_alpha=q,
+                              n_estimators=75, max_depth=2, learning_rate=0.05,
+                              reg_alpha=0.5, reg_lambda=2.0, subsample=0.8,
+                              random_state=42, verbosity=0)
+            m.fit(X.iloc[:i], y.iloc[:i], sample_weight=weight[:i])
+            step_models[name] = m
+        q_preds = predict_quantiles_sorted(step_models, X.iloc[[i]])
+        actual = y.iloc[i]
+        records.append({
+            'date': dates[i], 'actual': actual,
+            'low': q_preds['low'], 'median': q_preds['median'], 'high': q_preds['high'],
+            'in_interval': q_preds['low'] <= actual <= q_preds['high'],
+        })
+    if not records:
+        return None
+    coverage = np.mean([r['in_interval'] for r in records])
+    nominal_coverage = QUANTILES['high'] - QUANTILES['low']
+    return {'records': records, 'coverage': coverage, 'nominal_coverage': nominal_coverage}
 
 
 # ==========================================
@@ -297,6 +340,23 @@ def build_bounds_and_density(weekly, cols, margin=EXTRAPOLATION_MARGIN):
 def density_penalty(point, mean, std, Xz, k=3):
     dists = np.linalg.norm(Xz - (np.array(point) - mean) / std, axis=1)
     return float(np.mean(np.sort(dists)[:min(k, len(dists))]))
+
+
+def make_feature_row(weekly_km, weekly_elev, reference_temp, long_run_ratio,
+                      hr_signal, effort_signal, fixed_hr=None, fixed_load=None):
+    """
+    Shared feature-construction logic. Used by both the GA optimizer and the
+    interactive what-if simulator so they can never silently drift apart —
+    previously this logic lived only inside optimize_training as a closure.
+    """
+    row = {'weekly_km': weekly_km, 'long_run_km': weekly_km * long_run_ratio,
+           'avg_temp': reference_temp, 'weekly_elevation': weekly_elev}
+    if hr_signal:
+        row['avg_hr'] = fixed_hr
+        row['intensity_index'] = weekly_km * (fixed_hr / 160)
+    elif effort_signal:
+        row['avg_training_load'] = fixed_load
+    return row
 
 
 def optimize_training(models, weekly, hr_signal, effort_signal, exponent):
@@ -328,14 +388,8 @@ def optimize_training(models, weekly, hr_signal, effort_signal, exponent):
 
     def feature_row(v):
         weekly_km, weekly_elev = v
-        row = {'weekly_km': weekly_km, 'long_run_km': weekly_km * long_run_ratio,
-               'avg_temp': reference_temp, 'weekly_elevation': weekly_elev}
-        if hr_signal:
-            row['avg_hr'] = fixed_hr
-            row['intensity_index'] = weekly_km * (fixed_hr / 160)
-        elif effort_signal:
-            row['avg_training_load'] = fixed_load
-        return row
+        return make_feature_row(weekly_km, weekly_elev, reference_temp, long_run_ratio,
+                                 hr_signal, effort_signal, fixed_hr, fixed_load)
 
     def objective(v):
         row = feature_row(v)
@@ -384,15 +438,21 @@ def process_pipeline(file_bytes):
 
     models, imp = train_quantile_models(X, y, weight)
     wf_result = walk_forward_validation(X, y, weight, weekly.index)
+    calibration = walk_forward_calibration(X, y, weight, weekly.index)
     v, predictions, reference_temp, long_run_ratio = optimize_training(
         models, weekly, hr_signal, effort_signal, exponent
     )
 
+    fixed_hr = weekly['avg_hr'].mean()
+    fixed_load = weekly['avg_training_load'].mean() if effort_signal else None
+
     return {
         'error': None, 'report': report, 'exponent': exponent, 'exp_msg': exp_msg,
         'weekly': weekly, 'before': before, 'after': after, 'models': models, 'imp': imp,
-        'wf_result': wf_result, 'v': v, 'predictions': predictions,
+        'wf_result': wf_result, 'calibration': calibration, 'v': v, 'predictions': predictions,
         'reference_temp': reference_temp, 'long_run_ratio': long_run_ratio,
+        'hr_signal': hr_signal, 'effort_signal': effort_signal,
+        'fixed_hr': fixed_hr, 'fixed_load': fixed_load,
     }
 
 
@@ -476,6 +536,78 @@ if uploaded_file is not None:
         st.caption(f"Race temperature isn't something you can control, so it's not optimized above. "
                    f"Your quality weeks tend to cluster around **{results['reference_temp']:.1f}°C** — "
                    f"that's an observation, not a target to chase.")
+
+    st.divider()
+
+    # --- MODEL VALIDATION: does it beat a naive guess, and is it calibrated? ---
+    st.subheader("🔍 Model Validation")
+    vcol1, vcol2 = st.columns(2)
+
+    with vcol1:
+        st.markdown("**Beats a naive guess?**")
+        if wf_result:
+            improvement = wf_result['naive_rmse'] - wf_result['rmse']
+            st.metric("Walk-forward RMSE", f"{wf_result['rmse']:.1f} sec/km",
+                       delta=f"{improvement:+.1f} vs. naive baseline", delta_color="normal")
+            st.caption(f"Naive baseline (\"next week = last week\") RMSE: {wf_result['naive_rmse']:.1f} sec/km. "
+                       + ("The model is adding real predictive value beyond persistence."
+                          if improvement > 0 else
+                          "⚠️ The model isn't clearly beating a naive guess — treat predictions with extra caution."))
+        else:
+            st.info("Not enough data yet for this check.")
+
+    with vcol2:
+        st.markdown("**Are the confidence ranges honest?**")
+        if results['calibration']:
+            cal = results['calibration']
+            target_pct = cal['nominal_coverage'] * 100
+            actual_pct = cal['coverage'] * 100
+            st.metric("Actual coverage", f"{actual_pct:.0f}%", delta=f"target: {target_pct:.0f}%", delta_color="off")
+            gap = abs(actual_pct - target_pct)
+            if gap <= 15:
+                st.caption("✅ Reasonably well calibrated given how little data this is built on.")
+            else:
+                st.caption("⚠️ The displayed ranges don't yet hit their target coverage — "
+                           "treat them as a rough band, not a precise probability statement.")
+        else:
+            st.info("Not enough data yet for this check.")
+
+    st.divider()
+
+    # --- WHAT-IF SIMULATOR ---
+    st.subheader("🔮 What-If Simulator")
+    st.caption("Drag the sliders to see how the model's prediction changes — this queries the model directly, "
+               "independent of the GA-chosen 'optimal' point above.")
+
+    km_lo = max(0.0, weekly['weekly_km'].min() * 0.5)
+    km_hi = weekly['weekly_km'].max() * 1.5
+    elev_lo = 0.0
+    elev_hi = max(weekly['weekly_elevation'].max() * 1.5, 50.0)
+
+    scol1, scol2 = st.columns(2)
+    sim_km = scol1.slider("Weekly volume (km)", float(km_lo), float(km_hi), float(v[0]), step=0.5)
+    sim_elev = scol2.slider("Weekly elevation (m)", float(elev_lo), float(elev_hi), float(v[1]), step=5.0)
+
+    sim_row = make_feature_row(sim_km, sim_elev, results['reference_temp'], results['long_run_ratio'],
+                                results['hr_signal'], results['effort_signal'],
+                                results['fixed_hr'], results['fixed_load'])
+    sim_X = pd.DataFrame([sim_row])[results['models']['median'].feature_names_in_]
+    sim_quantiles = predict_quantiles_sorted(results['models'], sim_X)
+
+    # Flag if this combination is far from anything actually observed —
+    # reuses the same density-penalty logic the optimizer is constrained by.
+    ga_cols = ['weekly_km', 'weekly_elevation']
+    _, dmean, dstd, dXz = build_bounds_and_density(weekly, ga_cols)
+    dist = density_penalty([sim_km, sim_elev], dmean, dstd, dXz)
+    if dist > 1.5:
+        st.warning("⚠️ This combination is far outside anything in your actual training history — "
+                   "treat this prediction as speculative extrapolation, not a grounded estimate.")
+
+    rcol1, rcol2 = st.columns(2)
+    for col, label in zip([rcol1, rcol2], TARGET_DISTANCES_KM):
+        fitness_pace = sim_quantiles['median']
+        med_time = riegel_convert_pace(fitness_pace, 5.0, TARGET_DISTANCES_KM[label], results['exponent']) * TARGET_DISTANCES_KM[label]
+        col.metric(f"Predicted {label}", format_time(med_time))
 
     if st.button("⬇️ Prepare results for download"):
         out_df = pd.DataFrame([{
